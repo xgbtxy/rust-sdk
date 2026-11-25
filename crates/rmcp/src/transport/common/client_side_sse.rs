@@ -463,6 +463,12 @@ where
                             }
                             this.connector
                                 .handle_stream_error(&e, this.last_event_id.as_deref());
+                            if this.retry_policy.retry(0).is_none() {
+                                this.state.set(SseAutoReconnectStreamState::Terminated);
+                                return Poll::Ready(
+                                    this.connector.map_fatal_stream_error(e).map(Err),
+                                );
+                            }
                             let retrying = this
                                 .connector
                                 .retry_connection(this.last_event_id.as_deref());
@@ -480,12 +486,13 @@ where
                                 return Poll::Ready(None);
                             }
                             // Per SEP-1699, a graceful stream close is
-                            // reconnectable.  If the server sent a `retry` field
-                            // we MUST wait that long before reconnecting.
-                            let interval = this
-                                .server_retry_interval
-                                .take()
-                                .or_else(|| this.retry_policy.retry(0));
+                            // reconnectable when the retry policy permits it.
+                            // If the server sent a `retry` field we MUST wait
+                            // that long before reconnecting, and retain it for
+                            // subsequent backoff retries.
+                            let interval = this.retry_policy.retry(0).map(|policy_interval| {
+                                this.server_retry_interval.unwrap_or(policy_interval)
+                            });
                             if let Some(interval) = interval {
                                 tracing::debug!(
                                     ?interval,
@@ -497,6 +504,7 @@ where
                                 }
                             } else {
                                 tracing::debug!("sse stream terminated, no reconnect policy");
+                                this.state.set(SseAutoReconnectStreamState::Terminated);
                                 return Poll::Ready(None);
                             }
                         }
@@ -876,5 +884,136 @@ mod tests {
         assert!(policy.retry(0).is_some());
         assert!(policy.retry(2).is_some());
         assert!(policy.retry(3).is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_error_with_zero_retry_policy_terminates_without_reconnecting() {
+        let policies: [Arc<dyn SseRetryPolicy>; 2] = [
+            Arc::new(NeverRetry),
+            Arc::new(FixedInterval {
+                max_times: Some(0),
+                duration: Duration::ZERO,
+            }),
+        ];
+
+        for policy in policies {
+            let source = futures::stream::iter([Err::<Bytes, _>(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset",
+            ))]);
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let connector = CountingReconnect {
+                attempts: attempts.clone(),
+            };
+            let stream =
+                SseAutoReconnectStream::new(bounded_sse_stream(source, 1024), connector, policy);
+            let mut stream = std::pin::pin!(stream);
+
+            let first = stream.next().await;
+            assert!(
+                matches!(first, Some(Err(TestReconnectError::Sse(_)))),
+                "expected fatal stream error, got {first:?}"
+            );
+            assert_eq!(attempts.load(Ordering::Relaxed), 0);
+            assert!(stream.next().await.is_none());
+            assert_eq!(attempts.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn graceful_close_after_server_retry_hint_honors_never_retry() {
+        let source = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+            b"id: 0/0\nretry: 50\ndata:\n\n",
+        ))]);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let connector = CountingReconnect {
+            attempts: attempts.clone(),
+        };
+        let stream = SseAutoReconnectStream::new(
+            bounded_sse_stream(source, 1024),
+            connector,
+            Arc::new(NeverRetry),
+        );
+        let mut stream = std::pin::pin!(stream);
+
+        assert!(stream.next().await.is_none());
+        assert_eq!(attempts.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn graceful_close_without_reconnect_policy_transitions_to_terminated() {
+        let mut exhausted = false;
+        let inner: BoxedSseResponse = futures::stream::poll_fn(move |_| {
+            assert!(
+                !exhausted,
+                "SseAutoReconnectStream must not re-poll the inner stream after EOF"
+            );
+            exhausted = true;
+            Poll::Ready(None)
+        })
+        .boxed();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let connector = CountingReconnect {
+            attempts: attempts.clone(),
+        };
+        let stream = SseAutoReconnectStream::new(inner, connector, Arc::new(NeverRetry));
+        let mut stream = std::pin::pin!(stream);
+
+        assert!(stream.next().await.is_none());
+        assert!(stream.next().await.is_none());
+        assert_eq!(attempts.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_reconnect_after_graceful_close_preserves_server_retry_floor() {
+        struct RecordingReconnect {
+            timestamps: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+        }
+
+        impl SseStreamReconnect for RecordingReconnect {
+            type Error = TestReconnectError;
+            type Future = futures::future::Ready<Result<BoxedSseResponse, Self::Error>>;
+
+            fn retry_connection(&mut self, _last_event_id: Option<&str>) -> Self::Future {
+                self.timestamps
+                    .lock()
+                    .expect("timestamps lock")
+                    .push(tokio::time::Instant::now());
+                futures::future::ready(Err(TestReconnectError::Reconnect))
+            }
+        }
+
+        let start = tokio::time::Instant::now();
+        let source = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+            b"id: 1\nretry: 5000\ndata:\n\n",
+        ))]);
+        let timestamps = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stream = SseAutoReconnectStream::new(
+            bounded_sse_stream(source, 1024),
+            RecordingReconnect {
+                timestamps: timestamps.clone(),
+            },
+            Arc::new(FixedInterval {
+                max_times: Some(2),
+                duration: Duration::from_millis(10),
+            }),
+        );
+        let mut stream = std::pin::pin!(stream);
+
+        let result = stream.next().await;
+        assert!(matches!(result, Some(Err(TestReconnectError::Reconnect))));
+
+        let recorded = timestamps.lock().expect("timestamps lock");
+        assert_eq!(recorded.len(), 2);
+        assert!(
+            recorded[0].duration_since(start) >= Duration::from_millis(5000),
+            "initial reconnect after graceful close should honor server retry hint, waited {:?}",
+            recorded[0].duration_since(start)
+        );
+        assert!(
+            recorded[1].duration_since(recorded[0]) >= Duration::from_millis(5000),
+            "subsequent retry after failed reconnect must preserve server retry floor, waited {:?}",
+            recorded[1].duration_since(recorded[0])
+        );
     }
 }
